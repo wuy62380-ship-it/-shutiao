@@ -4,7 +4,7 @@
 # YW 全场景终极中转管理面板 (双引擎 T0)
 # TCP/直播流 -> HAProxy + NOTRACK (稳如老狗)
 # UDP/游戏流 -> iptables NAT (极致低延迟)
-# 内置 1G 内存防 OOM 保命机制
+# 底层：1G-64G 内存智能自适应防 OOM 引擎
 # ==========================================
 
 if [ -f "$0" ]; then sed -i 's/\r$//' "$0" 2>/dev/null; fi
@@ -38,7 +38,9 @@ save_rules() {
     fi
 }
 
-# 环境初始化：安装 HAProxy 并配置底层基础设施
+# ==========================================
+# 核心底层：1G-64G 全场景智能自适应引擎
+# ==========================================
 init_env() {
     # 1. 检查并安装 HAProxy
     if ! command -v haproxy >/dev/null 2>&1; then
@@ -60,27 +62,52 @@ init_env() {
         sysctl -p > /dev/null 2>&1
     fi
 
-    # 3. 跨国大包防坑：MSS 钳制 (TCP直播必加)
+    # 3. 跨国大包防坑：MSS 钳制
     if ! iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
         iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
         save_rules
     fi
 
-    # 4. 【核心重构】强制生成 1G 内存安全的主配置文件
-    # 只要检测到主配置不是 YW 的标准格式，或者没有包含安全参数，就强制覆盖并备份原文件
+    # 4. 动态性能算法：根据内存计算极限并发与文件描述符
+    local mem_mb=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo)
+    local safe_maxconn=1500
+    local safe_maxfd=65535
+
+    if [ "$mem_mb" -ge 64000 ]; then
+        safe_maxconn=120000; safe_maxfd=200000
+    elif [ "$mem_mb" -ge 32000 ]; then
+        safe_maxconn=80000; safe_maxfd=150000
+    elif [ "$mem_mb" -ge 16000 ]; then
+        safe_maxconn=50000; safe_maxfd=100000
+    elif [ "$mem_mb" -ge 8000 ]; then
+        safe_maxconn=30000; safe_maxfd=65000
+    elif [ "$mem_mb" -ge 4000 ]; then
+        safe_maxconn=15000; safe_maxfd=50000
+    elif [ "$mem_mb" -ge 2000 ]; then
+        safe_maxconn=5000; safe_maxfd=32768
+    fi
+    # <= 1G 保持默认的 1500 / 65535 (保命模式)
+
+    # 5. 检测是否需要重建主配置
     local need_rebuild=0
     if ! grep -q "YW Ultimate Safe Core" "$MAIN_CFG" 2>/dev/null; then
+        need_rebuild=1
+    elif ! grep -q "maxconn ${safe_maxconn}" "$MAIN_CFG" 2>/dev/null; then
         need_rebuild=1
     fi
 
     if [ "$need_rebuild" -eq 1 ]; then
-        echo -e "${Y}正在部署 HAProxy 1G内存安全核心...${R}"
+        echo -e "${Y}正在部署 HAProxy 智能核心...${R}"
+        echo -e "${H}  ├─ 检测内存: ${mem_mb} MB${R}"
+        echo -e "${H}  ├─ 并发上限: ${safe_maxconn}${R}"
+        echo -e "${H}  └─ 描述符数: ${safe_maxfd}${R}"
+        
         [ -f "$MAIN_CFG" ] && cp "$MAIN_CFG" "${MAIN_CFG}.bak.$(date +%s)"
         
-        cat > "$MAIN_CFG" << 'MAIN_EOF'
+        cat > "$MAIN_CFG" << MAIN_EOF
 # ==========================================
-# YW Ultimate Safe Core (1G内存防 OOM 特化)
-# 请勿修改此文件，所有业务配置在 yw.cfg 中
+# YW Ultimate Safe Core (1G-64G 全自适应版)
+# 动态生成于: $(date '+%Y-%m-%d %H:%M:%S')
 # ==========================================
 global
     log /dev/log local0
@@ -91,8 +118,8 @@ global
     user haproxy
     group haproxy
     daemon
-    # 【保命锁 1】1G内存极限最大并发，宁可拒绝新连接，绝不 OOM 死机
-    maxconn 1500
+    maxconn ${safe_maxconn}
+    maxfd ${safe_maxfd}
 
 defaults
     log global
@@ -100,27 +127,25 @@ defaults
     option tcplog
     option dontlognull
     timeout connect 5s
-    # 【保命锁 2】全局默认超时 5 分钟。如果 yw.cfg 里没特殊说明，死连接 5 分钟后强杀回收内存
     timeout client 5m
     timeout server 5m
     timeout check 2s
 
 # YW 面板动态配置区 (严禁删除此行)
- $INCLUDE /etc/haproxy/haproxy-yw.cfg
+\$INCLUDE /etc/haproxy/haproxy-yw.cfg
 MAIN_EOF
     fi
 
-    # 5. 初始化 YW 专属配置文件
+    # 6. 初始化 YW 专属配置文件
     if [ ! -f "$YW_CFG" ]; then
         cat > "$YW_CFG" << 'EOF'
 # ==========================================
 # YW 面板自动生成的 HAProxy 配置
-# 请勿手动修改，以免被面板覆盖
 # ==========================================
 EOF
     fi
 
-    # 6. 确保开机自启并应用
+    # 7. 确保开机自启并应用
     systemctl enable haproxy > /dev/null 2>&1
     reload_haproxy
 }
@@ -151,7 +176,6 @@ add_haproxy() {
     read -e -p "请输入中转机监听端口: " FRONTEND_PORT
     [[ ! "$FRONTEND_PORT" =~ ^[0-9]+$ ]] && echo -e "${RED}端口错误！${R}" && return
 
-    # 防止端口冲突
     if iptables -t nat -C PREROUTING -p tcp --dport "$FRONTEND_PORT" -j DNAT 2>/dev/null; then
         echo -e "${RED}冲突！端口 $FRONTEND_PORT 已被 iptables TCP 规则占用。${R}"; return
     fi
@@ -159,22 +183,18 @@ add_haproxy() {
         echo -e "${Y}HAProxy 中端口 $FRONTEND_PORT 已存在。${R}"; return
     fi
 
-    # 1. 核心：为该端口添加 NOTRACK
     iptables -t raw -A PREROUTING -p tcp --dport "$FRONTEND_PORT" -j NOTRACK
     save_rules
 
-    # 2. 追加配置（注意：这里的 2h 超时会覆盖主配置的 5m，专门为直播长连接量身定制）
     cat >> "$YW_CFG" << EOF
 
 # YW_RULE_START_${FRONTEND_PORT}
 frontend fe_${FRONTEND_PORT}
     bind *:${FRONTEND_PORT}
-    # 直播特化：覆盖全局5m，允许保持2小时不断开
     timeout client 2h
     default_backend be_${FRONTEND_PORT}
 
 backend be_${FRONTEND_PORT}
-    # 直播特化：覆盖全局5m
     timeout server 2h
     balance roundrobin
     option tcp-check
@@ -183,7 +203,6 @@ backend be_${FRONTEND_PORT}
 # YW_RULE_END_${FRONTEND_PORT}
 EOF
 
-    # 3. 语法检查并重载
     if reload_haproxy; then
         echo -e "${G}✅ 添加成功：${C}$(get_my_ip):${FRONTEND_PORT} -> ${BACKEND_IP}:${BACKEND_PORT} [HAProxy/TCP/NOTRACK]${R}"
     else
