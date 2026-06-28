@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 
 # ==========================================
-# YW 全场景终极中转管理面板 (双引擎 T0)
-# TCP/直播流 -> HAProxy + NOTRACK (稳如老狗)
-# UDP/游戏流 -> iptables NAT (极致低延迟)
-# 底层：1G-64G 内存智能自适应防 OOM 引擎
+# YW 全场景终极中转管理面板 (生产级封神版)
+# TCP/直播流 -> HAProxy + NOTRACK
+# UDP/游戏流 -> iptables NAT
+# 底层：1G-64G 内存自适应 + OS级防穿透引擎
 # ==========================================
 
 if [ -f "$0" ]; then sed -i 's/\r$//' "$0" 2>/dev/null; fi
@@ -16,8 +16,8 @@ RED="\033[31m"; C="\033[36m"; B="\033[97m"; P="\033[35m"
 
 YW_CFG="/etc/haproxy/haproxy-yw.cfg"
 MAIN_CFG="/etc/haproxy/haproxy.cfg"
+SYSCTL_CFG="/etc/sysctl.d/99-yw-transit.conf"
 
-# 获取本机公网 IP
 get_my_ip() {
     local ip
     ip=$(curl -4 -s --connect-timeout 3 https://ifconfig.me 2>/dev/null || \
@@ -26,7 +26,6 @@ get_my_ip() {
     echo "${ip:-未知IP}"
 }
 
-# 持久化 iptables 规则
 save_rules() {
     if command -v netfilter-persistent >/dev/null 2>&1; then
         netfilter-persistent save > /dev/null 2>&1
@@ -39,7 +38,7 @@ save_rules() {
 }
 
 # ==========================================
-# 核心底层：1G-64G 全场景智能自适应引擎
+# 核心底层：生产级环境初始化引擎
 # ==========================================
 init_env() {
     # 1. 检查并安装 HAProxy
@@ -56,19 +55,27 @@ init_env() {
         echo -e "${G}HAProxy 安装成功！${R}"
     fi
 
-    # 2. 开启内核转发
-    if ! grep -q "^net.ipv4.ip_forward.*=.*1" /etc/sysctl.conf 2>/dev/null; then
-        echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
-        sysctl -p > /dev/null 2>&1
+    # 2. 现代化 Sysctl 配置 (防冲突)
+    if [ ! -f "$SYSCTL_CFG" ] || ! grep -q "net.ipv4.ip_forward" "$SYSCTL_CFG" 2>/dev/null; then
+        echo "net.ipv4.ip_forward = 1" > "$SYSCTL_CFG"
+        sysctl -p "$SYSCTL_CFG" > /dev/null 2>&1
     fi
 
     # 3. 跨国大包防坑：MSS 钳制
     if ! iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
         iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-        save_rules
     fi
 
-    # 4. 动态性能算法：根据内存计算极限并发与文件描述符
+    # 4. 【防穿透补丁】放行 FORWARD 链 (UDP游戏转发的生命线)
+    if ! iptables -C FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; then
+        iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+    fi
+    # 允许我们的中转机主动发起的转发包出去
+    if ! iptables -C FORWARD -i lo -j ACCEPT 2>/dev/null; then
+        iptables -I FORWARD -i lo -j ACCEPT
+    fi
+
+    # 5. 动态性能算法
     local mem_mb=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo)
     local safe_maxconn=1500
     local safe_maxfd=65535
@@ -86,9 +93,16 @@ init_env() {
     elif [ "$mem_mb" -ge 2000 ]; then
         safe_maxconn=5000; safe_maxfd=32768
     fi
-    # <= 1G 保持默认的 1500 / 65535 (保命模式)
 
-    # 5. 检测是否需要重建主配置
+    # 6. 【OS级授权补丁】解除 Linux 对 HAProxy 的文件描述符封锁
+    if ! grep -q "haproxy.*nofile.*${safe_maxfd}" /etc/security/limits.conf 2>/dev/null; then
+        sed -i '/^haproxy.*nofile/d' /etc/security/limits.conf 2>/dev/null
+        echo -e "haproxy soft nofile ${safe_maxfd}\nhaproxy hard nofile ${safe_maxfd}" >> /etc/security/limits.conf
+        # 让当前 session 也立刻生效（无需重启）
+        ulimit -n $safe_maxfd 2>/dev/null
+    fi
+
+    # 7. 检测是否需要重建主配置
     local need_rebuild=0
     if ! grep -q "YW Ultimate Safe Core" "$MAIN_CFG" 2>/dev/null; then
         need_rebuild=1
@@ -97,16 +111,16 @@ init_env() {
     fi
 
     if [ "$need_rebuild" -eq 1 ]; then
-        echo -e "${Y}正在部署 HAProxy 智能核心...${R}"
+        echo -e "${Y}正在部署 HAProxy 生产级核心...${R}"
         echo -e "${H}  ├─ 检测内存: ${mem_mb} MB${R}"
         echo -e "${H}  ├─ 并发上限: ${safe_maxconn}${R}"
-        echo -e "${H}  └─ 描述符数: ${safe_maxfd}${R}"
+        echo -e "${H}  └─ OS级文件锁: ${safe_maxfd}${R}"
         
         [ -f "$MAIN_CFG" ] && cp "$MAIN_CFG" "${MAIN_CFG}.bak.$(date +%s)"
         
         cat > "$MAIN_CFG" << MAIN_EOF
 # ==========================================
-# YW Ultimate Safe Core (1G-64G 全自适应版)
+# YW Ultimate Safe Core (生产级全自适应版)
 # 动态生成于: $(date '+%Y-%m-%d %H:%M:%S')
 # ==========================================
 global
@@ -136,7 +150,6 @@ defaults
 MAIN_EOF
     fi
 
-    # 6. 初始化 YW 专属配置文件
     if [ ! -f "$YW_CFG" ]; then
         cat > "$YW_CFG" << 'EOF'
 # ==========================================
@@ -145,12 +158,11 @@ MAIN_EOF
 EOF
     fi
 
-    # 7. 确保开机自启并应用
     systemctl enable haproxy > /dev/null 2>&1
+    save_rules
     reload_haproxy
 }
 
-# 重载 HAProxy 配置（带语法检查）
 reload_haproxy() {
     if haproxy -c -f "$MAIN_CFG" > /dev/null 2>&1; then
         systemctl reload haproxy > /dev/null 2>&1
@@ -159,6 +171,15 @@ reload_haproxy() {
         echo -e "${RED}HAProxy 配置语法错误，拒绝重载！${R}"
         return 1
     fi
+}
+
+# 端口合法性严格校验函数
+check_port() {
+    local port=$1
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        echo -e "${RED}端口错误！必须是 1-65535 之间的数字。${R}"; return 1
+    fi
+    return 0
 }
 
 # ==========================================
@@ -171,10 +192,10 @@ add_haproxy() {
     [[ ! "$BACKEND_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo -e "${RED}IP 格式错误！${R}" && return
 
     read -e -p "请输入落地机端口: " BACKEND_PORT
-    [[ ! "$BACKEND_PORT" =~ ^[0-9]+$ ]] && echo -e "${RED}端口错误！${R}" && return
+    check_port "$BACKEND_PORT" || return
 
     read -e -p "请输入中转机监听端口: " FRONTEND_PORT
-    [[ ! "$FRONTEND_PORT" =~ ^[0-9]+$ ]] && echo -e "${RED}端口错误！${R}" && return
+    check_port "$FRONTEND_PORT" || return
 
     if iptables -t nat -C PREROUTING -p tcp --dport "$FRONTEND_PORT" -j DNAT 2>/dev/null; then
         echo -e "${RED}冲突！端口 $FRONTEND_PORT 已被 iptables TCP 规则占用。${R}"; return
@@ -184,7 +205,6 @@ add_haproxy() {
     fi
 
     iptables -t raw -A PREROUTING -p tcp --dport "$FRONTEND_PORT" -j NOTRACK
-    save_rules
 
     cat >> "$YW_CFG" << EOF
 
@@ -204,12 +224,12 @@ backend be_${FRONTEND_PORT}
 EOF
 
     if reload_haproxy; then
+        save_rules
         echo -e "${G}✅ 添加成功：${C}$(get_my_ip):${FRONTEND_PORT} -> ${BACKEND_IP}:${BACKEND_PORT} [HAProxy/TCP/NOTRACK]${R}"
     else
         echo -e "${RED}配置写入失败，正在回滚...${R}"
         iptables -t raw -D PREROUTING -p tcp --dport "$FRONTEND_PORT" -j NOTRACK 2>/dev/null
         sed -i "/# YW_RULE_START_${FRONTEND_PORT}/,/# YW_RULE_END_${FRONTEND_PORT}/d" "$YW_CFG"
-        save_rules
     fi
 }
 
@@ -223,10 +243,10 @@ add_iptables() {
     [[ ! "$BACKEND_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo -e "${RED}IP 格式错误！${R}" && return
 
     read -e -p "请输入落地机端口: " BACKEND_PORT
-    [[ ! "$BACKEND_PORT" =~ ^[0-9]+$ ]] && echo -e "${RED}端口错误！${R}" && return
+    check_port "$BACKEND_PORT" || return
 
     read -e -p "请输入中转机监听端口: " FRONTEND_PORT
-    [[ ! "$FRONTEND_PORT" =~ ^[0-9]+$ ]] && echo -e "${RED}端口错误！${R}" && return
+    check_port "$FRONTEND_PORT" || return
 
     if grep -q "bind \*:${FRONTEND_PORT}" "$YW_CFG" 2>/dev/null; then
         echo -e "${RED}冲突！端口 $FRONTEND_PORT 已被 HAProxy 占用。${R}"; return
@@ -353,7 +373,6 @@ view_rules() {
     [ $has_rules -eq 0 ] && echo -e "${H}当前没有任何转发规则。${R}"
 }
 
-# 运行外部内核调优
 run_kernel_tune() {
     echo -e "${C}正在拉取 kernel-smart.sh...${R}"
     FILE="/tmp/kernel-smart.sh"
@@ -376,7 +395,7 @@ while true; do
     clear
     MYIP=$(get_my_ip)
     echo -e "${G}========================================${R}"
-    echo -e "${G}   YW 全场景终极中转面板 (双引擎 T0)   "
+    echo -e "${G}    YW 生产级全场景中转面板 (T0)       "
     echo -e "${G}========================================${R}"
     echo -e "本机 IP: ${C}${MYIP}${R}"
     echo -e "${G}----------------------------------------${R}"
