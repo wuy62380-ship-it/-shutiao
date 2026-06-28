@@ -4,6 +4,7 @@
 # YW 全场景终极中转管理面板 (双引擎 T0)
 # TCP/直播流 -> HAProxy + NOTRACK (稳如老狗)
 # UDP/游戏流 -> iptables NAT (极致低延迟)
+# 内置 1G 内存防 OOM 保命机制
 # ==========================================
 
 if [ -f "$0" ]; then sed -i 's/\r$//' "$0" 2>/dev/null; fi
@@ -65,7 +66,51 @@ init_env() {
         save_rules
     fi
 
-    # 4. 初始化 YW 专属配置文件，并在主配置中引入
+    # 4. 【核心重构】强制生成 1G 内存安全的主配置文件
+    # 只要检测到主配置不是 YW 的标准格式，或者没有包含安全参数，就强制覆盖并备份原文件
+    local need_rebuild=0
+    if ! grep -q "YW Ultimate Safe Core" "$MAIN_CFG" 2>/dev/null; then
+        need_rebuild=1
+    fi
+
+    if [ "$need_rebuild" -eq 1 ]; then
+        echo -e "${Y}正在部署 HAProxy 1G内存安全核心...${R}"
+        [ -f "$MAIN_CFG" ] && cp "$MAIN_CFG" "${MAIN_CFG}.bak.$(date +%s)"
+        
+        cat > "$MAIN_CFG" << 'MAIN_EOF'
+# ==========================================
+# YW Ultimate Safe Core (1G内存防 OOM 特化)
+# 请勿修改此文件，所有业务配置在 yw.cfg 中
+# ==========================================
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    chroot /var/lib/haproxy
+    stats socket /run/haproxy/admin.sock mode 660 level admin
+    stats timeout 30s
+    user haproxy
+    group haproxy
+    daemon
+    # 【保命锁 1】1G内存极限最大并发，宁可拒绝新连接，绝不 OOM 死机
+    maxconn 1500
+
+defaults
+    log global
+    mode tcp
+    option tcplog
+    option dontlognull
+    timeout connect 5s
+    # 【保命锁 2】全局默认超时 5 分钟。如果 yw.cfg 里没特殊说明，死连接 5 分钟后强杀回收内存
+    timeout client 5m
+    timeout server 5m
+    timeout check 2s
+
+# YW 面板动态配置区 (严禁删除此行)
+ $INCLUDE /etc/haproxy/haproxy-yw.cfg
+MAIN_EOF
+    fi
+
+    # 5. 初始化 YW 专属配置文件
     if [ ! -f "$YW_CFG" ]; then
         cat > "$YW_CFG" << 'EOF'
 # ==========================================
@@ -74,11 +119,8 @@ init_env() {
 # ==========================================
 EOF
     fi
-    if ! grep -q "haproxy-yw.cfg" "$MAIN_CFG" 2>/dev/null; then
-        echo -e "\n# YW Ultimate Transit Include\n\$INCLUDE ${YW_CFG}\n" >> "$MAIN_CFG"
-    fi
 
-    # 5. 确保 HAProxy 开机自启并应用一次配置
+    # 6. 确保开机自启并应用
     systemctl enable haproxy > /dev/null 2>&1
     reload_haproxy
 }
@@ -109,31 +151,30 @@ add_haproxy() {
     read -e -p "请输入中转机监听端口: " FRONTEND_PORT
     [[ ! "$FRONTEND_PORT" =~ ^[0-9]+$ ]] && echo -e "${RED}端口错误！${R}" && return
 
-    # 防止端口冲突：检查该端口是否已被 iptables 的 TCP 规则占用
+    # 防止端口冲突
     if iptables -t nat -C PREROUTING -p tcp --dport "$FRONTEND_PORT" -j DNAT 2>/dev/null; then
         echo -e "${RED}冲突！端口 $FRONTEND_PORT 已被 iptables TCP 规则占用。${R}"; return
     fi
-
-    # 检查 HAProxy 内是否已存在
     if grep -q "bind \*:${FRONTEND_PORT}" "$YW_CFG" 2>/dev/null; then
         echo -e "${Y}HAProxy 中端口 $FRONTEND_PORT 已存在。${R}"; return
     fi
 
-    # 1. 核心：为该端口添加 NOTRACK，彻底抛弃 conntrack
+    # 1. 核心：为该端口添加 NOTRACK
     iptables -t raw -A PREROUTING -p tcp --dport "$FRONTEND_PORT" -j NOTRACK
     save_rules
 
-    # 2. 追加 HAProxy 配置 (针对跨国直播优化了超时和缓冲区)
+    # 2. 追加配置（注意：这里的 2h 超时会覆盖主配置的 5m，专门为直播长连接量身定制）
     cat >> "$YW_CFG" << EOF
 
 # YW_RULE_START_${FRONTEND_PORT}
 frontend fe_${FRONTEND_PORT}
     bind *:${FRONTEND_PORT}
+    # 直播特化：覆盖全局5m，允许保持2小时不断开
     timeout client 2h
     default_backend be_${FRONTEND_PORT}
 
 backend be_${FRONTEND_PORT}
-    timeout connect 5s
+    # 直播特化：覆盖全局5m
     timeout server 2h
     balance roundrobin
     option tcp-check
@@ -146,7 +187,6 @@ EOF
     if reload_haproxy; then
         echo -e "${G}✅ 添加成功：${C}$(get_my_ip):${FRONTEND_PORT} -> ${BACKEND_IP}:${BACKEND_PORT} [HAProxy/TCP/NOTRACK]${R}"
     else
-        # 如果失败，回滚操作
         echo -e "${RED}配置写入失败，正在回滚...${R}"
         iptables -t raw -D PREROUTING -p tcp --dport "$FRONTEND_PORT" -j NOTRACK 2>/dev/null
         sed -i "/# YW_RULE_START_${FRONTEND_PORT}/,/# YW_RULE_END_${FRONTEND_PORT}/d" "$YW_CFG"
@@ -169,12 +209,10 @@ add_iptables() {
     read -e -p "请输入中转机监听端口: " FRONTEND_PORT
     [[ ! "$FRONTEND_PORT" =~ ^[0-9]+$ ]] && echo -e "${RED}端口错误！${R}" && return
 
-    # 防止端口冲突：检查该端口是否被 HAProxy 占用
     if grep -q "bind \*:${FRONTEND_PORT}" "$YW_CFG" 2>/dev/null; then
         echo -e "${RED}冲突！端口 $FRONTEND_PORT 已被 HAProxy 占用。${R}"; return
     fi
 
-    # 强制走 UDP
     PROTO="udp"
     if iptables -t nat -C PREROUTING -p "$PROTO" --dport "$FRONTEND_PORT" -j DNAT --to-destination "$BACKEND_IP:$BACKEND_PORT" 2>/dev/null; then
         echo -e "${Y}UDP 端口 $FRONTEND_PORT 已存在。${R}"; return
@@ -198,7 +236,6 @@ del_rule() {
     rules=()
     rule_types=()
 
-    # 收集 HAProxy 规则
     while IFS= read -r port; do
         if [[ -n "$port" ]]; then
             dest=$(grep -A5 "frontend fe_${port}" "$YW_CFG" | grep "server svr" | awk '{print $3}')
@@ -207,7 +244,6 @@ del_rule() {
         fi
     done < <(grep "YW_RULE_START" "$YW_CFG" | awk -F'_' '{print $NF}')
 
-    # 收集 iptables UDP 规则
     while IFS= read -r line; do
         if [[ -n "$line" ]]; then
             port=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="--dport") print $(i+1)}')
@@ -245,19 +281,15 @@ del_rule() {
     del_type="${type_map[$sel]}"
 
     if [ "$del_type" = "haproxy" ]; then
-        # 删除 NOTRACK
         iptables -t raw -D PREROUTING -p tcp --dport "$del_port" -j NOTRACK 2>/dev/null
-        # 删除配置块
         sed -i "/# YW_RULE_START_${del_port}/,/# YW_RULE_END_${del_port}/d" "$YW_CFG"
         reload_haproxy
         save_rules
         echo -e "${G}✅ 已删除 HAProxy 端口 ${del_port} 的规则。${R}"
     else
-        # 删除 iptables UDP 规则
         dest_full=$(iptables-save -t nat | awk -v p="$del_port" '/PREROUTING/ && /DNAT/ && /-p udp/ && $0 ~ ("--dport "p) {for(i=1;i<=NF;i++) if($i=="--to-destination") print $(i+1)}')
         iptables -t nat -D PREROUTING -p udp --dport "$del_port" -j DNAT --to-destination "$dest_full" 2>/dev/null
         
-        # 智能清理 MASQUERADE
         if ! iptables-save -t nat | grep "PREROUTING" | grep -q "${dest_full%%:*}"; then
             iptables -t nat -D POSTROUTING -d "${dest_full%%:*}" -j MASQUERADE 2>/dev/null
         fi
@@ -275,7 +307,6 @@ view_rules() {
     idx=1
     has_rules=0
 
-    # 显示 HAProxy 规则
     while IFS= read -r port; do
         if [[ -n "$port" ]]; then
             dest=$(grep -A5 "frontend fe_${port}" "$YW_CFG" | grep "server svr" | awk '{print $3}')
@@ -284,7 +315,6 @@ view_rules() {
         fi
     done < <(grep "YW_RULE_START" "$YW_CFG" | awk -F'_' '{print $NF}')
 
-    # 显示 iptables 规则
     declare -A ipt_display
     while IFS= read -r line; do
         if [[ -n "$line" ]]; then
